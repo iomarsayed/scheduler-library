@@ -96,3 +96,14 @@ type Unpreemption struct {
 	// preemption. Unpreempt refuses to run once the snapshot has moved past it.
 	validPreemptionVersion uint64
 }
+
+// SchedulePodGroupOptions contains options for scheduling a pod group.
+type SchedulePodGroupOptions struct {
+	CommonSchedulingOptions
+}
+
+func NewSchedulePodGroupOptions(dryRun bool) SchedulePodGroupOptions {
+	return SchedulePodGroupOptions{
+		CommonSchedulingOptions: CommonSchedulingOptions{DryRun: dryRun},
+	}
+}

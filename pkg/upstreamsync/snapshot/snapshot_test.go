@@ -23,6 +23,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -1118,5 +1120,310 @@ func TestResetMutations_NodeGenerationRestored(t *testing.T) {
 	// Compare generations after reset with initial generations
 	if diff := cmp.Diff(initialGenerations, getGenerations()); diff != "" {
 		t.Errorf("Generations don't match (-want +got):\n%s", diff)
+	}
+}
+
+func TestSchedulePodGroup(t *testing.T) {
+	ctx := context.Background()
+
+	node4CPU := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	node8CPU := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "8",
+		v1.ResourceMemory: "8Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	gangPG := st.MakePodGroup().Name("gang-pg").Namespace("default").MinCount(2).Obj()
+	disjointPG := st.MakePodGroup().Name("disjoint-pg").Namespace("default").MinCount(1).Obj()
+
+	rootCPG := st.MakeCompositePodGroup().Name("root-cpg").Namespace("default").MinGroupCount(2).Obj()
+	leafPG1 := st.MakePodGroup().Name("leaf-1").Namespace("default").ParentCompositePodGroup("root-cpg").MinCount(1).Obj()
+	leafPG2 := st.MakePodGroup().Name("leaf-2").Namespace("default").ParentCompositePodGroup("root-cpg").MinCount(1).Obj()
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-1").PodGroupName("gang-pg").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-2").PodGroupName("gang-pg").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+
+	heavyPod1 := st.MakePod().Name("hp1").Namespace("default").UID("uid-h1").PodGroupName("gang-pg").Req(map[v1.ResourceName]string{v1.ResourceCPU: "3"}).Obj()
+	heavyPod2 := st.MakePod().Name("hp2").Namespace("default").UID("uid-h2").PodGroupName("gang-pg").Req(map[v1.ResourceName]string{v1.ResourceCPU: "3"}).Obj()
+
+	leafPod1 := st.MakePod().Name("lp1").Namespace("default").UID("uid-l1").PodGroupName("leaf-1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+	leafPod2 := st.MakePod().Name("lp2").Namespace("default").UID("uid-l2").PodGroupName("leaf-2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+
+	disjointPod := st.MakePod().Name("dp").Namespace("default").UID("uid-dp").PodGroupName("disjoint-pg").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj()
+	noPGPod := st.MakePod().Name("no-pg").Namespace("default").UID("uid-nopg").Obj()
+	missingPGPod := st.MakePod().Name("missing-pg").Namespace("default").UID("uid-mpg").PodGroupName("missing-pg-name").Obj()
+
+	tests := []struct {
+		name                string
+		nodes               []*v1.Node
+		podGroups           []*schedulingv1beta1.PodGroup
+		compositePodGroups  []*schedulingv1alpha3.CompositePodGroup
+		pods                []*v1.Pod
+		opts                SchedulePodGroupOptions
+		expectResults       []SchedulingResult
+		expectSnapshotState map[string]sets.Set[string]
+		expectErr           bool
+	}{
+		{
+			name:               "Success - schedule flat pod group",
+			nodes:              []*v1.Node{node8CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups: nil,
+			pods:               []*v1.Pod{pod1, pod2},
+			opts:               NewSchedulePodGroupOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: pod1, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+				{Pod: pod2, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("pod1", "pod2")},
+		},
+		{
+			name:               "Success - schedule composite pod group",
+			nodes:              []*v1.Node{node8CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{leafPG1, leafPG2},
+			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{rootCPG},
+			pods:               []*v1.Pod{leafPod1, leafPod2},
+			opts:               NewSchedulePodGroupOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: leafPod1, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+				{Pod: leafPod2, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": sets.New("lp1", "lp2")},
+		},
+		{
+			name:               "DryRun - returns results without persisting to snapshot",
+			nodes:              []*v1.Node{node8CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups: nil,
+			pods:               []*v1.Pod{pod1, pod2},
+			opts:               NewSchedulePodGroupOptions(true),
+			expectResults: []SchedulingResult{
+				{Pod: pod1, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+				{Pod: pod2, SelectedNodeName: "node1", Status: fwk.NewStatus(fwk.Success)},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+		},
+		{
+			name:               "Failure - gang unschedulable rolls back snapshot reservations",
+			nodes:              []*v1.Node{node4CPU},
+			podGroups:          []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups: nil,
+			pods:               []*v1.Pod{heavyPod1, heavyPod2},
+			opts:               NewSchedulePodGroupOptions(false),
+			expectResults: []SchedulingResult{
+				{Pod: heavyPod1, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "no pods were schedulable")},
+				{Pod: heavyPod2, SelectedNodeName: "", Status: fwk.NewStatus(fwk.Unschedulable, "pod group is unschedulable")},
+			},
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+		},
+		{
+			name:                "Empty pod list returns nil",
+			nodes:               []*v1.Node{node8CPU},
+			podGroups:           []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups:  nil,
+			pods:                nil,
+			opts:                NewSchedulePodGroupOptions(false),
+			expectResults:       nil,
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+		},
+		{
+			name:                "Validation error - pod not member of any PodGroup",
+			nodes:               []*v1.Node{node8CPU},
+			podGroups:           []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups:  nil,
+			pods:                []*v1.Pod{noPGPod},
+			opts:                NewSchedulePodGroupOptions(false),
+			expectResults:       nil,
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+			expectErr:           true,
+		},
+		{
+			name:                "Validation error - pod group not found in snapshot",
+			nodes:               []*v1.Node{node8CPU},
+			podGroups:           []*schedulingv1beta1.PodGroup{gangPG},
+			compositePodGroups:  nil,
+			pods:                []*v1.Pod{missingPGPod},
+			opts:                NewSchedulePodGroupOptions(false),
+			expectResults:       nil,
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+			expectErr:           true,
+		},
+		{
+			name:                "Validation error - pods belong to disjoint hierarchies",
+			nodes:               []*v1.Node{node8CPU},
+			podGroups:           []*schedulingv1beta1.PodGroup{gangPG, disjointPG},
+			compositePodGroups:  nil,
+			pods:                []*v1.Pod{pod1, disjointPod},
+			opts:                NewSchedulePodGroupOptions(false),
+			expectResults:       nil,
+			expectSnapshotState: map[string]sets.Set[string]{"node1": nil},
+			expectErr:           true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(
+				ctx,
+				nil,
+				tt.nodes,
+				tt.podGroups,
+				tt.compositePodGroups,
+			)
+			if err != nil {
+				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+			}
+			cs := New(snap, profileMap)
+
+			results, err := cs.SchedulePodGroup(ctx, tt.pods, tt.opts)
+			if (err != nil) != tt.expectErr {
+				t.Fatalf("SchedulePodGroup() error = %v, expectErr %v", err, tt.expectErr)
+			}
+
+			if !tt.expectErr && len(tt.expectResults) > 0 {
+				if len(results) != len(tt.expectResults) {
+					t.Fatalf("SchedulePodGroup() got %d results, want %d", len(results), len(tt.expectResults))
+				}
+				for i := range results {
+					if results[i].SelectedNodeName != tt.expectResults[i].SelectedNodeName {
+						t.Errorf("result[%d] SelectedNodeName = %q, want %q", i, results[i].SelectedNodeName, tt.expectResults[i].SelectedNodeName)
+					}
+					if results[i].Status.IsSuccess() != tt.expectResults[i].Status.IsSuccess() {
+						t.Errorf("result[%d] Status.IsSuccess = %v, want %v", i, results[i].Status.IsSuccess(), tt.expectResults[i].Status.IsSuccess())
+					}
+				}
+			}
+
+			ft.VerifySnapshot(t, snap, tt.expectSnapshotState)
+		})
+	}
+}
+
+func TestSnapshot_ActionSequences_SchedulePodGroup(t *testing.T) {
+	ctx := context.Background()
+
+	node1 := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "4",
+		v1.ResourceMemory: "4Gi",
+		v1.ResourcePods:   "10",
+	}).Obj()
+
+	pg1 := st.MakePodGroup().Name("gang-pg1").Namespace("default").MinCount(2).Obj()
+	pg2 := st.MakePodGroup().Name("gang-pg2").Namespace("default").MinCount(2).Obj()
+
+	pod1 := st.MakePod().Name("pod1").Namespace("default").UID("uid-1").PodGroupName("gang-pg1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+	pod2 := st.MakePod().Name("pod2").Namespace("default").UID("uid-2").PodGroupName("gang-pg1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+	pod3 := st.MakePod().Name("pod3").Namespace("default").UID("uid-3").PodGroupName("gang-pg2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+	pod4 := st.MakePod().Name("pod4").Namespace("default").UID("uid-4").PodGroupName("gang-pg2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+
+	extraPod := st.MakePod().Name("extra-pod").Namespace("default").UID("uid-extra").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Obj()
+
+	tests := []struct {
+		name string
+		test func(t *testing.T, cs *ClusterSnapshot, snap *cache.Snapshot)
+	}{
+		{
+			name: "SchedulePodGroup consumes node capacity observed by subsequent CanSchedulePod",
+			test: func(t *testing.T, cs *ClusterSnapshot, snap *cache.Snapshot) {
+				placement, _ := cs.MakePlacement([]string{"node1"})
+
+				// Schedule pod group (uses 4 CPU out of 4 CPU)
+				results, err := cs.SchedulePodGroup(ctx, []*v1.Pod{pod1, pod2}, NewSchedulePodGroupOptions(false))
+				if err != nil || len(results) != 2 || !results[0].Status.IsSuccess() {
+					t.Fatalf("SchedulePodGroup failed: %v, results: %v", err, results)
+				}
+
+				// Subsequent pod requiring 1 CPU should now be rejected (no CPU left on node1)
+				feasibleNodes, diag, err := cs.CanSchedulePod(ctx, extraPod, placement)
+				if err != nil {
+					t.Fatalf("CanSchedulePod error: %v", err)
+				}
+				if len(feasibleNodes) != 0 {
+					t.Errorf("Expected 0 feasible nodes, got %v (diagnosis: %v)", feasibleNodes, diag)
+				}
+
+				// ResetMutations restores capacity
+				if err := cs.ResetMutations(); err != nil {
+					t.Fatalf("ResetMutations failed: %v", err)
+				}
+				feasibleNodesAfterReset, _, err := cs.CanSchedulePod(ctx, extraPod, placement)
+				if err != nil {
+					t.Fatalf("CanSchedulePod after reset error: %v", err)
+				}
+				if len(feasibleNodesAfterReset) != 1 {
+					t.Errorf("Expected node1 to be feasible after ResetMutations, got %v", feasibleNodesAfterReset)
+				}
+			},
+		},
+		{
+			name: "SchedulePodGroup inside Transaction is undone on Revert",
+			test: func(t *testing.T, cs *ClusterSnapshot, snap *cache.Snapshot) {
+				err := cs.Transaction(ctx, func() (TransactionResult, error) {
+					_, err := cs.SchedulePodGroup(ctx, []*v1.Pod{pod1, pod2}, NewSchedulePodGroupOptions(false))
+					if err != nil {
+						return Revert, err
+					}
+					return Revert, nil
+				})
+				if err != nil {
+					t.Fatalf("Transaction failed: %v", err)
+				}
+
+				// Node1 should have 0 pods after transaction revert
+				n1, _ := snap.Get("node1")
+				if len(n1.GetPods()) != 0 {
+					t.Errorf("Expected 0 pods on node1 after Transaction Revert, got %d", len(n1.GetPods()))
+				}
+			},
+		},
+		{
+			name: "SchedulePodGroup called multiple times consecutively verifies previous pod group results persist in snapshot",
+			test: func(t *testing.T, cs *ClusterSnapshot, snap *cache.Snapshot) {
+				// First SchedulePodGroup schedules pg1 (uses 4 CPU out of 4 CPU on node1)
+				results1, err := cs.SchedulePodGroup(ctx, []*v1.Pod{pod1, pod2}, NewSchedulePodGroupOptions(false))
+				if err != nil || len(results1) != 2 || !results1[0].Status.IsSuccess() {
+					t.Fatalf("First SchedulePodGroup failed: %v, results: %v", err, results1)
+				}
+
+				n1, err := snap.Get("node1")
+				if err != nil {
+					t.Fatalf("Failed to get node1: %v", err)
+				}
+				if len(n1.GetPods()) != 2 {
+					t.Fatalf("Expected 2 pods on node1 after first SchedulePodGroup, got %d", len(n1.GetPods()))
+				}
+
+				// Second SchedulePodGroup with pg2 (requires 4 CPU) should fail because node1 capacity is consumed
+				results2, err := cs.SchedulePodGroup(ctx, []*v1.Pod{pod3, pod4}, NewSchedulePodGroupOptions(false))
+				if err != nil {
+					t.Fatalf("Second SchedulePodGroup unexpected error: %v", err)
+				}
+				if len(results2) > 0 && results2[0].Status.IsSuccess() {
+					t.Fatalf("Expected second SchedulePodGroup to fail due to insufficient node capacity, got: %v", results2)
+				}
+
+				// Node1 should still contain only the 2 pods from pg1
+				n1After, _ := snap.Get("node1")
+				if len(n1After.GetPods()) != 2 {
+					t.Errorf("Expected 2 pods on node1 after failed second SchedulePodGroup, got %d", len(n1After.GetPods()))
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profileMap, snap, err := ft.SetupSnapshotTestWithPodGroups(ctx, nil, []*v1.Node{node1}, []*schedulingv1beta1.PodGroup{pg1, pg2}, nil)
+			if err != nil {
+				t.Fatalf("SetupSnapshotTestWithPodGroups failed: %v", err)
+			}
+			cs := New(snap, profileMap)
+			tt.test(t, cs, snap)
+		})
 	}
 }
